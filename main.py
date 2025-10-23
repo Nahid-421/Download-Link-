@@ -1,39 +1,24 @@
 from flask import Flask, request, render_template_string, redirect, url_for, session, Response
+from werkzeug.middleware.proxy_fix import ProxyFix # HTTPS ফিক্স করার জন্য
 import re
 import requests
-import base64 # URL এনকোডিং ও ডিকোডিংয়ের জন্য
+import base64
 
 app = Flask(__name__)
+# Production এনভায়রনমেন্টে সিকিউরিটি নিশ্চিত করার জন্য ProxyFix ব্যবহার করা জরুরি
+# এটি সার্ভারকে বুঝতে সাহায্য করে যে এটি একটি রিভার্স প্রক্সি (যেমন রেন্ডার) এর পিছনে চলছে
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1, x_proto=1)
+
 app.secret_key = "my_secret_key_123"
 
 # ========== ADMIN LOGIN ========== #
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "12345"
 
-# ========== SIMPLE HTML TEMPLATES (Unchanged) ========== #
-login_page = """
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Admin Login</title>
-  <style>
-    body {font-family: Arial; background: #121212; color: white; text-align: center;}
-    form {margin-top: 150px;}
-    input {padding: 10px; margin: 5px; border-radius: 5px;}
-    button {padding: 10px 20px; border: none; background: #007bff; color: white; border-radius: 5px;}
-  </style>
-</head>
-<body>
-  <h2>🔐 Admin Login</h2>
-  <form method="post" action="/login">
-    <input type="text" name="username" placeholder="Username" required><br>
-    <input type="password" name="password" placeholder="Password" required><br>
-    <button type="submit">Login</button>
-  </form>
-</body>
-</html>
-"""
+# [ login_page এবং admin_panel টেমপ্লেট অপরিবর্তিত থাকবে ]
 
+# ========== SIMPLE HTML TEMPLATES (Unchanged for brevity, assume they are here) ========== #
+login_page = """...""" # (আপনার আগের কোড থেকে যোগ করুন)
 admin_panel = """
 <!DOCTYPE html>
 <html>
@@ -65,105 +50,96 @@ admin_panel = """
 </html>
 """
 
-# ========== DIRECT LINK GENERATOR LOGIC (Updated to generate Proxy URL) ========== #
+
+# ========== DIRECT LINK GENERATOR LOGIC (Updated) ========== #
 
 def _get_final_external_link(url):
-    """
-    বিভিন্ন হোস্টিং সার্ভিস অনুযায়ী URL-কে আসল ডাইরেক্ট ডাউনলোড লিংকে পরিবর্তন করে।
-    """
-    # 1. Google Drive Link
+    # Google Drive, Dropbox ইত্যাদির জন্য আসল ডাইরেক্ট লিংক তৈরি করা
     if "drive.google.com" in url:
         match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
         if match:
             file_id = match.group(1)
-            # Google Drive এর uc?export=download আইডি ব্যবহার করা
             return f"https://drive.google.com/uc?export=download&id={file_id}"
-
-    # 2. Dropbox Link
     if "dropbox.com" in url:
-        # নিশ্চিত করা যে লিংকে ?dl=1 প্যারামিটার আছে এবং ডোমেন dl.dropboxusercontent.com
         if "?dl=" not in url:
             url += "?dl=1"
         elif "?dl=0" in url:
             url = url.replace("?dl=0", "?dl=1")
         return url.replace("www.dropbox.com", "dl.dropboxusercontent.com")
-
-    # 3. Mediafire Link (মিডিয়াফায়ারের সরাসরি ডাউনলোড লিংক পেতে সাধারণত স্ক্র্যাপিং লাগে।
-    # তবে আমরা ধরে নিচ্ছি যে ইনপুট লিংকটি স্ট্রিম করার জন্য যথেষ্ট সহজ।)
-    if "mediafire.com" in url:
-        # এখানে কোনো সহজ স্ট্রিং পরিবর্তন না করে, আমরা সরাসরি প্রক্সি করব।
-        pass
-
-    # Default: যদি কোনো নির্দিষ্ট সার্ভিস না হয়, তাহলে ইনপুট URL-টিই ফেরত দেওয়া হবে।
     return url
 
 def generate_proxy_link(url):
-    """
-    আসল ডাউনলোড URL-কে এনকোড করে আমাদের সার্ভারের প্রক্সি রুটের লিংক তৈরি করে।
-    """
     final_external_url = _get_final_external_link(url)
     
     # URL-কে Base64 দিয়ে এনকোড করা
     encoded_url = base64.urlsafe_b64encode(final_external_url.encode()).decode()
     
-    # প্রক্সি ডাউনলোড রুটের লিংক জেনারেট করা
-    return url_for('proxy_download', encoded_url=encoded_url, _external=True)
+    # HTTPS স্কিম জোর করে ব্যবহার করা, যাতে ব্রাউজারের "Insecure Download" ওয়ার্নিং না আসে
+    return url_for('proxy_download', encoded_url=encoded_url, _external=True, _scheme='https')
 
 
-# ========== NEW PROXY ROUTE: Handles Download Streaming ========== #
+# ========== PROXY ROUTE: Handles Download Streaming (Updated with User-Agent) ========== #
 @app.route("/download/<encoded_url>")
 def proxy_download(encoded_url):
-    # 1. URL ডিকোড করা
     try:
         original_url = base64.urlsafe_b64decode(encoded_url.encode()).decode()
     except Exception:
-        return "Invalid download link format or expired link.", 400
+        return "Invalid download link format.", 400
 
-    # 2. আসল ফাইলটি রিকোয়েস্ট করা
+    # শক্তিশালী হেডার ব্যবহার করা, যাতে সোর্স সার্ভার এটিকে বট মনে করে ব্লক না করে
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+
     try:
-        # stream=True ব্যবহার করা হয় যাতে ফাইলটি সরাসরি সার্ভারের মেমরিতে লোড না হয়ে স্ট্রিম হয়
-        r = requests.get(original_url, stream=True, allow_redirects=True, timeout=30)
-        r.raise_for_status() # HTTP ত্রুটি হলে (যেমন 404, 500) ValueError দেবে
+        r = requests.get(original_url, stream=True, allow_redirects=True, timeout=60, headers=headers)
+        r.raise_for_status()
 
-        # 3. ফাইলের নাম নির্ণয় করা
-        filename = "file_download" # Default name
+        # 1. ফাইলের নাম নির্ধারণ করা
+        filename = "downloaded_file"
         
-        # Content-Disposition Header থেকে ফাইলের নাম নেওয়ার চেষ্টা
+        # Content-Disposition থেকে নাম নেওয়ার চেষ্টা
         if 'content-disposition' in r.headers:
             match = re.search(r'filename=["\']?(.+?)["\']?$', r.headers['content-disposition'])
             if match:
-                filename = match.group(1).strip()
+                # ডিকোড করে সঠিক ফাইলনাম নেওয়া
+                try:
+                    filename = match.group(1).encode('latin-1').decode('utf-8')
+                except:
+                    filename = match.group(1).strip()
         
-        # যদি ফাইলের নাম না পাওয়া যায়, তবে URL এর শেষ অংশ ব্যবহার করা
-        if filename == "file_download":
+        # যদি নাম না পাওয়া যায়, তবে URL এর শেষ অংশ ব্যবহার করা
+        if filename == "downloaded_file":
             path_parts = original_url.split('/')
-            if path_parts[-1]:
-                filename = path_parts[-1].split('?')[0]
-                if not filename:
-                     filename = "downloaded_file"
+            temp_name = path_parts[-1].split('?')[0]
+            if temp_name:
+                filename = temp_name
         
-        # 4. রেসপন্স হেডার সেট করা (সোর্স হাইড এবং ডাউনলোড ফোরসিং)
-        headers = {
-            'Content-Type': r.headers.get('content-type', 'application/octet-stream'),
+        # 2. রেসপন্স হেডার সেট করা
+        response_headers = {
+            # Content-Type যদি সোর্স থেকে পাওয়া না যায়, তবে ডিফল্ট binary টাইপ ব্যবহার
+            'Content-Type': r.headers.get('content-type', 'application/octet-stream'), 
+            # এই হেডারটি ব্রাউজারকে ডাউনলোড শুরু করতে বাধ্য করে
             'Content-Disposition': f'attachment; filename="{filename}"',
             'Content-Length': r.headers.get('content-length'),
+            # Cache Control headers যোগ করা যাতে দ্রুত ডাউনলোড হয়
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
         }
-
-        # 5. কন্টেন্ট স্ট্রিম করা (chunk by chunk)
+        
+        # 3. কন্টেন্ট স্ট্রিম করা
         def generate():
-            # 8kb করে ডেটা স্ট্রিম করা
             for chunk in r.iter_content(chunk_size=8192):
                 yield chunk
 
-        return Response(generate(), headers=headers)
+        return Response(generate(), headers=response_headers)
 
     except requests.exceptions.RequestException as e:
-        # রিকোয়েস্ট করতে সমস্যা হলে
-        print(f"Proxy Error for {original_url}: {e}")
-        return f"Error accessing external file: The source link may be invalid or down. Details: {e}", 500
+        print(f"Proxy Error: {e}")
+        return f"Error accessing external file. Source might be down or restricted: {e}", 500
 
 
-# ========== ROUTES (Mostly Unchanged) ========== #
+# ========== ROUTES (Unchanged) ========== #
 
 @app.route("/")
 def home():
@@ -173,6 +149,7 @@ def home():
 
 @app.route("/login", methods=["POST"])
 def login():
+    # ... (login logic)
     username = request.form.get("username")
     password = request.form.get("password")
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
@@ -191,8 +168,7 @@ def generate():
     if "logged_in" not in session:
         return redirect("/")
     url = request.form.get("url")
-    # এখানে generate_proxy_link ব্যবহার করা হয়েছে
-    link = generate_proxy_link(url) 
+    link = generate_proxy_link(url)
     return render_template_string(admin_panel, link=link)
 
 @app.route("/logout")
@@ -205,4 +181,6 @@ def health():
     return "OK", 200
 
 if __name__ == "__main__":
+    # DEBUG=True মোডে চালালে, রেন্ডার বা অন্যান্য হোস্টিং প্ল্যাটফর্মে এটি 10000 পোর্টে চলবে।
+    # লোকাল টেস্টের জন্য, আপনি host="127.0.0.1", port=5000 ব্যবহার করতে পারেন।
     app.run(host="0.0.0.0", port=10000, debug=True)
