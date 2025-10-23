@@ -1,24 +1,45 @@
 from flask import Flask, request, render_template_string, redirect, url_for, session, Response
-from werkzeug.middleware.proxy_fix import ProxyFix # HTTPS ফিক্স করার জন্য
+from werkzeug.middleware.proxy_fix import ProxyFix
 import re
 import requests
 import base64
+import time
 
 app = Flask(__name__)
-# Production এনভায়রনমেন্টে সিকিউরিটি নিশ্চিত করার জন্য ProxyFix ব্যবহার করা জরুরি
-# এটি সার্ভারকে বুঝতে সাহায্য করে যে এটি একটি রিভার্স প্রক্সি (যেমন রেন্ডার) এর পিছনে চলছে
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1, x_proto=1)
 
 app.secret_key = "my_secret_key_123"
 
-# ========== ADMIN LOGIN ========== #
+# ========== ADMIN LOGIN (Unchanged) ========== #
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "12345"
 
-# [ login_page এবং admin_panel টেমপ্লেট অপরিবর্তিত থাকবে ]
+# [ login_page and admin_panel templates remain the same ]
+# (আপনার আগের কোড থেকে টেমপ্লেট দুটি যুক্ত করে দিন)
 
-# ========== SIMPLE HTML TEMPLATES (Unchanged for brevity, assume they are here) ========== #
-login_page = """...""" # (আপনার আগের কোড থেকে যোগ করুন)
+login_page = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Admin Login</title>
+  <style>
+    body {font-family: Arial; background: #121212; color: white; text-align: center;}
+    form {margin-top: 150px;}
+    input {padding: 10px; margin: 5px; border-radius: 5px;}
+    button {padding: 10px 20px; border: none; background: #007bff; color: white; border-radius: 5px;}
+  </style>
+</head>
+<body>
+  <h2>🔐 Admin Login</h2>
+  <form method="post" action="/login">
+    <input type="text" name="username" placeholder="Username" required><br>
+    <input type="password" name="password" placeholder="Password" required><br>
+    <button type="submit">Login</button>
+  </form>
+</body>
+</html>
+"""
+
 admin_panel = """
 <!DOCTYPE html>
 <html>
@@ -51,95 +72,152 @@ admin_panel = """
 """
 
 
-# ========== DIRECT LINK GENERATOR LOGIC (Updated) ========== #
+# ========== CORE FUNCTIONALITY: Google Drive Direct Download Fix ========== #
 
 def _get_final_external_link(url):
-    # Google Drive, Dropbox ইত্যাদির জন্য আসল ডাইরেক্ট লিংক তৈরি করা
+    """
+    বিভিন্ন হোস্টিং সার্ভিস অনুযায়ী URL-কে আসল ডাইরেক্ট ডাউনলোড লিংকে পরিবর্তন করে।
+    """
+    # 1. Google Drive Link
     if "drive.google.com" in url:
         match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
         if match:
             file_id = match.group(1)
-            return f"https://drive.google.com/uc?export=download&id={file_id}"
+            # Google Drive-এর জন্য আমরা শুধুমাত্র ফাইল আইডি পাঠাবো,
+            # এবং নিশ্চিত ডাইরেক্ট লিংক পাওয়ার কাজটি প্রক্সি ফাংশনে (proxy_download) করব।
+            return f"gdrive:{file_id}" 
+
+    # 2. Dropbox Link
     if "dropbox.com" in url:
         if "?dl=" not in url:
             url += "?dl=1"
         elif "?dl=0" in url:
             url = url.replace("?dl=0", "?dl=1")
         return url.replace("www.dropbox.com", "dl.dropboxusercontent.com")
+
+    # Default
     return url
 
 def generate_proxy_link(url):
     final_external_url = _get_final_external_link(url)
-    
-    # URL-কে Base64 দিয়ে এনকোড করা
     encoded_url = base64.urlsafe_b64encode(final_external_url.encode()).decode()
     
-    # HTTPS স্কিম জোর করে ব্যবহার করা, যাতে ব্রাউজারের "Insecure Download" ওয়ার্নিং না আসে
+    # HTTPS স্কিম জোর করে ব্যবহার করা
     return url_for('proxy_download', encoded_url=encoded_url, _external=True, _scheme='https')
 
 
-# ========== PROXY ROUTE: Handles Download Streaming (Updated with User-Agent) ========== #
+# ========== PROXY ROUTE: Handles Download Streaming (MAJOR UPDATE) ========== #
 @app.route("/download/<encoded_url>")
 def proxy_download(encoded_url):
     try:
-        original_url = base64.urlsafe_b64decode(encoded_url.encode()).decode()
+        original_url_tag = base64.urlsafe_b64decode(encoded_url.encode()).decode()
     except Exception:
         return "Invalid download link format.", 400
 
-    # শক্তিশালী হেডার ব্যবহার করা, যাতে সোর্স সার্ভার এটিকে বট মনে করে ব্লক না করে
+    # কমন রিকোয়েস্ট হেডার
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
-
-    try:
-        r = requests.get(original_url, stream=True, allow_redirects=True, timeout=60, headers=headers)
-        r.raise_for_status()
-
-        # 1. ফাইলের নাম নির্ধারণ করা
-        filename = "downloaded_file"
+    
+    # === Google Drive স্পেশাল হ্যান্ডলিং ===
+    if original_url_tag.startswith("gdrive:"):
+        file_id = original_url_tag.split(":")[1]
         
-        # Content-Disposition থেকে নাম নেওয়ার চেষ্টা
-        if 'content-disposition' in r.headers:
-            match = re.search(r'filename=["\']?(.+?)["\']?$', r.headers['content-disposition'])
+        # 1. ডাইরেক্ট ডাউনলোড URL তৈরি
+        gdrive_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        
+        try:
+            # 2. প্রথম রিকোয়েস্ট পাঠানো: এটি কনফার্মেশন পেজ নিয়ে আসে
+            r = requests.get(gdrive_url, stream=True, allow_redirects=True, timeout=15, headers=headers)
+            r.raise_for_status()
+            
+            # 3. টোকেন খোঁজা: যদি ভাইরাস স্ক্যান ওয়ার্নিং আসে, তবে টোকেন বের করা
+            match = re.search(r"confirm=([0-9A-Za-z_-]+)", r.text)
+            
             if match:
-                # ডিকোড করে সঠিক ফাইলনাম নেওয়া
-                try:
-                    filename = match.group(1).encode('latin-1').decode('utf-8')
-                except:
-                    filename = match.group(1).strip()
+                # টোকেন পাওয়া গেলে, URL পরিবর্তন করা (ভাইরাস স্ক্যান বাইপাস)
+                confirm_token = match.group(1)
+                final_download_url = f"{gdrive_url}&confirm={confirm_token}"
+                
+                # 4. কনফার্মেশন টোকেন দিয়ে দ্বিতীয় রিকোয়েস্ট পাঠানো
+                # এখানে কুকিজ সেট করা জরুরি, যাতে গুগল বুঝতে পারে যে কনফার্ম করা হয়েছে।
+                r = requests.get(final_download_url, 
+                                 stream=True, 
+                                 allow_redirects=True, 
+                                 timeout=60, 
+                                 headers=headers, 
+                                 cookies=r.cookies) # আগের রিকোয়েস্টের কুকিজ ব্যবহার করা
+                
+                r.raise_for_status()
+                
+            # যদি ম্যাচ না করে, তবে ফাইলটি ছোট ছিল বা সরাসরি ডাউনলোড শুরু হয়ে গেছে (প্রথম রিকোয়েস্টের রেসপন্স r ব্যবহার করা হবে)
+            
+            # ফাইলের নাম বের করা (Content-Disposition থেকে)
+            filename = "downloaded_file.bin"
+            if 'content-disposition' in r.headers:
+                name_match = re.search(r'filename=["\']?(.+?)["\']?$', r.headers['content-disposition'])
+                if name_match:
+                    try:
+                        filename = name_match.group(1).encode('latin-1').decode('utf-8')
+                    except:
+                        filename = name_match.group(1).strip()
+            
+            original_response = r
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Google Drive Error: {e}")
+            return f"Error accessing Google Drive file. Source might be down or restricted: {e}", 500
+            
+        original_url = "Google Drive File" # শুধু লগের জন্য
+
+    # === অন্যান্য ফাইল (Dropbox, Mediafire, etc.) হ্যান্ডলিং ===
+    else:
+        # এটা নন-Google Drive URL
+        try:
+            original_response = requests.get(original_url_tag, stream=True, allow_redirects=True, timeout=60, headers=headers)
+            original_response.raise_for_status()
+            
+            # ফাইলের নাম নির্ধারণ
+            filename = "downloaded_file.bin"
+            if 'content-disposition' in original_response.headers:
+                name_match = re.search(r'filename=["\']?(.+?)["\']?$', original_response.headers['content-disposition'])
+                if name_match:
+                    try:
+                        filename = name_match.group(1).encode('latin-1').decode('utf-8')
+                    except:
+                        filename = name_match.group(1).strip()
+            
+            # যদি নাম না পাওয়া যায়, তবে URL এর শেষ অংশ ব্যবহার করা
+            if filename == "downloaded_file.bin":
+                path_parts = original_url_tag.split('/')
+                temp_name = path_parts[-1].split('?')[0]
+                if temp_name:
+                    filename = temp_name
         
-        # যদি নাম না পাওয়া যায়, তবে URL এর শেষ অংশ ব্যবহার করা
-        if filename == "downloaded_file":
-            path_parts = original_url.split('/')
-            temp_name = path_parts[-1].split('?')[0]
-            if temp_name:
-                filename = temp_name
-        
-        # 2. রেসপন্স হেডার সেট করা
-        response_headers = {
-            # Content-Type যদি সোর্স থেকে পাওয়া না যায়, তবে ডিফল্ট binary টাইপ ব্যবহার
-            'Content-Type': r.headers.get('content-type', 'application/octet-stream'), 
-            # এই হেডারটি ব্রাউজারকে ডাউনলোড শুরু করতে বাধ্য করে
-            'Content-Disposition': f'attachment; filename="{filename}"',
-            'Content-Length': r.headers.get('content-length'),
-            # Cache Control headers যোগ করা যাতে দ্রুত ডাউনলোড হয়
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-        }
-        
-        # 3. কন্টেন্ট স্ট্রিম করা
-        def generate():
-            for chunk in r.iter_content(chunk_size=8192):
-                yield chunk
+        except requests.exceptions.RequestException as e:
+            print(f"General Proxy Error: {e}")
+            return f"Error accessing external file. Source might be down or restricted: {e}", 500
 
-        return Response(generate(), headers=response_headers)
+    # === রেসপন্স স্ট্রিম করা ===
+    
+    r = original_response
+    
+    response_headers = {
+        'Content-Type': r.headers.get('content-type', 'application/octet-stream'), 
+        'Content-Disposition': f'attachment; filename="{filename}"',
+        'Content-Length': r.headers.get('content-length'),
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+    }
+    
+    def generate():
+        for chunk in r.iter_content(chunk_size=8192):
+            yield chunk
 
-    except requests.exceptions.RequestException as e:
-        print(f"Proxy Error: {e}")
-        return f"Error accessing external file. Source might be down or restricted: {e}", 500
+    return Response(generate(), headers=response_headers)
 
 
-# ========== ROUTES (Unchanged) ========== #
+# [ROUTES: /, /login, /admin, /generate, /logout, /health অপরিবর্তিত]
 
 @app.route("/")
 def home():
@@ -149,7 +227,6 @@ def home():
 
 @app.route("/login", methods=["POST"])
 def login():
-    # ... (login logic)
     username = request.form.get("username")
     password = request.form.get("password")
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
@@ -181,6 +258,4 @@ def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    # DEBUG=True মোডে চালালে, রেন্ডার বা অন্যান্য হোস্টিং প্ল্যাটফর্মে এটি 10000 পোর্টে চলবে।
-    # লোকাল টেস্টের জন্য, আপনি host="127.0.0.1", port=5000 ব্যবহার করতে পারেন।
     app.run(host="0.0.0.0", port=10000, debug=True)
