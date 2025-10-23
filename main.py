@@ -4,10 +4,10 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from threading import Thread
 
+# ... (আপনার Configuration এবং Flask app ইনিশিয়ালাইজেশন একই থাকবে)
 # -----------------------------
 # Configuration
 # -----------------------------
-# Ensure these environment variables are set up in your deployment environment
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -19,20 +19,20 @@ STREAM_FOLDER = "streams"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(STREAM_FOLDER, exist_ok=True)
 
-# -----------------------------
-# Telegram Bot (Pyrogram)
-# -----------------------------
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Dictionary to store user files: {user_id: [file_path_1, file_path_2, ...]}
+# {user_id: {"dir": "path/to/user_dir", "files": ["file1.mp4", "file2.mp4"]}}
 user_files = {}
 
 # -----------------------------
-# HLS Conversion Function (Asynchronous)
+# HLS Conversion Function (Asynchronous) - FIXED
 # -----------------------------
-async def convert_and_stream(message: Message, file_paths: list):
+async def convert_and_stream(message: Message, user_session: dict):
     """Converts a list of video files to HLS using FFmpeg and sends the stream link."""
     
+    file_paths = user_session["files"]
+    temp_dir = user_session["dir"] # The single directory containing all files
+
     vid_id = str(uuid.uuid4())
     stream_dir = os.path.join(STREAM_FOLDER, vid_id)
     os.makedirs(stream_dir, exist_ok=True)
@@ -41,122 +41,119 @@ async def convert_and_stream(message: Message, file_paths: list):
     processing_message = await message.reply_text("⏳ Processing files. HLS link being generated...", quote=True)
 
     try:
-        # Create a safe input argument list for FFmpeg
         if len(file_paths) > 1:
-            # For multiple files, use the 'concat' demuxer
-            temp_dir = os.path.dirname(file_paths[0])
             concat_file_path = os.path.join(temp_dir, "concat_list.txt")
             with open(concat_file_path, "w") as f:
                 for path in file_paths:
-                    f.write(f"file '{path}'\n")
+                    # Use only the filename as FFmpeg will run from this directory
+                    f.write(f"file '{os.path.basename(path)}'\n")
             
             input_args = ["-f", "concat", "-safe", "0", "-i", concat_file_path]
         else:
-            # Single file input
             input_args = ["-i", file_paths[0]]
         
-        
-        # FFmpeg command for HLS conversion (using copy mode for speed)
+        # FFmpeg command for HLS conversion (RE-ENCODING for reliability)
+        # This is slower but works for videos with different properties
         cmd = [
             "ffmpeg", *input_args,
-            "-c:v", "copy", "-c:a", "copy",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", # Video re-encoding
+            "-c:a", "aac", "-b:a", "128k", # Audio re-encoding
             "-f", "hls", "-hls_time", "6", "-hls_list_size", "0",
             "-hls_flags", "delete_segments+temp_file",
             hls_file
         ]
 
-        # Execute FFmpeg asynchronously to avoid blocking the bot
-        process = await asyncio.create_subprocess_exec(*cmd, 
-                                                       stdout=subprocess.PIPE, 
-                                                       stderr=subprocess.PIPE)
-        
+        # If you are SURE all videos are identical, you can use the faster copy method:
+        # cmd = [
+        #     "ffmpeg", *input_args,
+        #     "-c", "copy",
+        #     "-f", "hls", "-hls_time", "6", "-hls_list_size", "0",
+        #     "-hls_flags", "delete_segments+temp_file",
+        #     hls_file
+        # ]
+
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = await process.communicate()
         
         if process.returncode != 0:
-            raise Exception(f"FFmpeg failed: {stderr.decode()}")
+            error_message = stderr.decode()
+            # Log the full error for debugging
+            print(f"FFMPEG ERROR: {error_message}") 
+            # Show a simpler error to the user
+            raise Exception(f"FFmpeg failed. Could not process the videos.")
         
         # Clean up uploaded files and temp folder
-        temp_dir = os.path.dirname(file_paths[0])
         shutil.rmtree(temp_dir, ignore_errors=True)
         
-        # Send back watch link
-        host_url = "https://YOUR_RENDER_URL"  # CHANGE THIS
+        # !! CHANGE THIS URL !!
+        host_url = os.getenv("RENDER_EXTERNAL_URL", "https://your-app-name.onrender.com")
         await processing_message.edit_text(
             f"✅ Video processed!\nWatch here: {host_url}/watch/{vid_id}"
         )
 
     except Exception as e:
-        # Cleanup stream directory if conversion fails
         shutil.rmtree(stream_dir, ignore_errors=True)
-        try:
-            temp_dir = os.path.dirname(file_paths[0])
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
-            
+        shutil.rmtree(temp_dir, ignore_errors=True)
         await processing_message.edit_text(f"❌ Processing Error: {str(e)}")
-            
 
 # -----------------------------
-# Telegram Handlers
+# Telegram Handlers - FIXED
 # -----------------------------
 @bot.on_message(filters.command("start"))
 async def start_cmd(client, message):
+    # Clean up any old data for the user
+    if message.chat.id in user_files:
+        shutil.rmtree(user_files[message.chat.id]["dir"], ignore_errors=True)
+        del user_files[message.chat.id]
+        
     await message.reply_text(
-        "👋 Send me your video files (480p/720p/1080p). "
+        "👋 Send me your video files (e.g., 480p/720p/1080p). "
         "When finished, reply with the text **done** or **ডান**."
     )
-    user_files[message.chat.id] = [] # Reset file list
 
 @bot.on_message(filters.private & (filters.document | filters.text))
 async def handle_user_input(client, message: Message):
     user_id = message.chat.id
 
-    # 1. 'DONE' Command Handling
     if message.text and message.text.lower() in ["done", "ডান"]:
-        if user_id not in user_files or not user_files[user_id]:
+        if user_id not in user_files or not user_files[user_id]["files"]:
             await message.reply_text("🤷‍♂️ You haven't sent any video files yet.", quote=True)
             return
         
-        # Start conversion process
-        file_paths_to_process = user_files.pop(user_id) # Get files and clear state
-        
-        # Run conversion as an asynchronous task
-        asyncio.create_task(convert_and_stream(message, file_paths_to_process))
+        user_session = user_files.pop(user_id)
+        asyncio.create_task(convert_and_stream(message, user_session))
         return
 
-    # 2. Video File Handling
-    if message.document and message.document.mime_type.startswith("video/"):
+    if message.document and message.document.mime_type and message.document.mime_type.startswith("video/"):
         
-        # Create unique and secure folder
-        vid_id = str(uuid.uuid4())
-        temp_dir = os.path.join(UPLOAD_FOLDER, vid_id)
-        os.makedirs(temp_dir, exist_ok=True)
+        # If this is the first file for the user, create a session and directory
+        if user_id not in user_files:
+            session_id = str(uuid.uuid4())
+            user_dir = os.path.join(UPLOAD_FOLDER, session_id)
+            os.makedirs(user_dir, exist_ok=True)
+            user_files[user_id] = {"dir": user_dir, "files": []}
         
-        # Use a random file name for security (avoiding shell injection via file names)
-        safe_file_name = str(uuid.uuid4()) + "_" + message.document.file_name
-        file_path = os.path.join(temp_dir, safe_file_name)
+        # Define file path inside the user's specific session directory
+        file_name = message.document.file_name
+        file_path = os.path.join(user_files[user_id]["dir"], file_name)
         
-        # Download file
+        download_msg = await message.reply_text(f"📥 Downloading '{file_name}'...", quote=True)
         await message.download(file_path)
 
-        # Update file list
-        if user_id not in user_files:
-            user_files[user_id] = []
-        user_files[user_id].append(file_path)
+        user_files[user_id]["files"].append(file_path)
         
-        count = len(user_files[user_id])
-        await message.reply_text(
-            f"✅ File {count} added. Send more or reply with **done**.",
-            quote=True
+        count = len(user_files[user_id]["files"])
+        await download_msg.edit_text(
+            f"✅ File {count} ('{file_name}') added.\nSend more files or reply with **done** or **ডান**."
         )
         return
     
-    # Ignore other text messages if the user is not in a 'file collection' state
-    if user_id not in user_files or not user_files[user_id]:
-        if not (message.text and message.text.lower() in ["done", "ডান"]):
-             await message.reply_text("Please send a video file or the command **done**.", quote=True)
+    # Ignore other text messages
+    if message.text:
+         await message.reply_text("Please send a video file, or type **done** to process.", quote=True)
 
+# ... (বাকি Flask এবং main ফাংশন একই থাকবে)
+# Just make sure to update the host_url in the conversion function.
 
 # -----------------------------
 # Flask Web Server
@@ -176,18 +173,23 @@ video { width:90%; height:auto; border-radius:15px; }
 </style>
 </head>
 <body>
-<h2>{{title}}</h2>
-<video id="video" class="video-js vjs-default-skin" controls></video>
+<h2>Now Streaming</h2>
+<video id="video" class="video-js vjs-default-skin" controls preload="auto"></video>
 <script>
 var video = document.getElementById('video');
-if(Hls.isSupported()){
+var videoSrc = '{{stream_url}}';
+if (Hls.isSupported()) {
   var hls = new Hls();
-  hls.loadSource('{{stream_url}}');
+  hls.loadSource(videoSrc);
   hls.attachMedia(video);
-  hls.on(Hls.Events.MANIFEST_PARSED,function(){video.play();});
-}else if(video.canPlayType('application/vnd.apple.mpegurl')){
-  video.src='{{stream_url}}';
-  video.addEventListener('loadedmetadata',function(){video.play();});
+  hls.on(Hls.Events.MANIFEST_PARSED, function() {
+    video.play();
+  });
+} else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+  video.src = videoSrc;
+  video.addEventListener('loadedmetadata', function() {
+    video.play();
+  });
 }
 </script>
 </body>
@@ -205,29 +207,24 @@ def stream(vid, filename):
 @app.route('/watch/<vid>')
 def watch(vid):
     stream_url = f"/stream/{vid}/master.m3u8"
-    return render_template_string(HTML_TEMPLATE, title="Now Streaming", stream_url=stream_url)
+    return render_template_string(HTML_TEMPLATE, stream_url=stream_url)
 
 # -----------------------------
-# Run Bot + Flask Concurrently (FIXED)
+# Run Bot + Flask Concurrently
 # -----------------------------
-
 def run_flask():
-    """Function to run Flask in a blocking thread."""
-    # Production deployment should use a proper WSGI server like Gunicorn/Waitress
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 
 async def main():
-    """Starts both the Pyrogram bot and the Flask server concurrently."""
     print("Starting Flask server...")
-    # 1. Start Flask server in a dedicated thread
     flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
     flask_thread.start()
     
     print("Starting Pyrogram bot...")
-    # 2. Start Pyrogram bot in the main asyncio event loop
     await bot.start()
     
-    # Keep the main loop running indefinitely to handle bot updates
+    print("Bot and Server are running!")
     await asyncio.Future() 
     
 if __name__ == "__main__":
