@@ -1,192 +1,120 @@
-# ... (Imports and boilerplate code remain the same) ...
-from flask import Flask, request, render_template_string, redirect, url_for, session, Response
-from werkzeug.middleware.proxy_fix import ProxyFix
-import re
-import requests
-import base64
-import time
+import os, uuid, shutil, subprocess
+from flask import Flask, request, render_template_string, send_from_directory, jsonify
+from pyrogram import Client, filters
+from pyrogram.types import Message
+
+# Load env
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1, x_proto=1)
-app.secret_key = "my_secret_key_123"
+UPLOAD_FOLDER = "uploads"
+STREAM_FOLDER = "streams"
 
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "12345"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(STREAM_FOLDER, exist_ok=True)
 
-# [ Templates are here ]
-login_page = "..."
-admin_panel = "..."
+# -----------------------------
+# Telegram Bot
+# -----------------------------
+bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# [ _get_final_external_link and generate_proxy_link remain the same ]
+@bot.on_message(filters.command("start"))
+def start_cmd(client, message):
+    message.reply_text("Send me 2-3 video files (480p/720p/1080p), I will create HLS streaming link!")
 
-def _get_final_external_link(url):
-    # Google Drive Link
-    if "drive.google.com" in url:
-        match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
-        if match:
-            file_id = match.group(1)
-            return f"gdrive:{file_id}" 
-    # Dropbox Link
-    if "dropbox.com" in url:
-        if "?dl=" not in url: url += "?dl=1"
-        elif "?dl=0" in url: url = url.replace("?dl=0", "?dl=1")
-        return url.replace("www.dropbox.com", "dl.dropboxusercontent.com")
-    return url
+@bot.on_message(filters.document)
+def handle_videos(client, message: Message):
+    # Only video files
+    if not message.document.mime_type.startswith("video/"):
+        message.reply_text("Please send a video file only.")
+        return
 
-def generate_proxy_link(url):
-    final_external_url = _get_final_external_link(url)
-    encoded_url = base64.urlsafe_b64encode(final_external_url.encode()).decode()
-    return url_for('proxy_download', encoded_url=encoded_url, _external=True, _scheme='https')
+    vid_id = str(uuid.uuid4())
+    temp_dir = os.path.join(UPLOAD_FOLDER, vid_id)
+    os.makedirs(temp_dir, exist_ok=True)
 
+    file_path = os.path.join(temp_dir, message.document.file_name)
+    message.download(file_path)
 
-# ========== PROXY ROUTE: Handles Download Streaming (Session Use Fix) ========== #
-@app.route("/download/<encoded_url>")
-def proxy_download(encoded_url):
-    try:
-        original_url_tag = base64.urlsafe_b64decode(encoded_url.encode()).decode()
-    except Exception:
-        return "Invalid download link format.", 400
+    # Convert to HLS
+    stream_dir = os.path.join(STREAM_FOLDER, vid_id)
+    os.makedirs(stream_dir, exist_ok=True)
+    hls_file = os.path.join(stream_dir, "master.m3u8")
 
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://www.google.com/',
-        'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8'
-    }
-    
-    original_url = original_url_tag 
+    # FFmpeg copy mode for low CPU load
+    cmd = [
+        "ffmpeg", "-i", file_path,
+        "-c:v", "copy", "-c:a", "copy",
+        "-f", "hls", "-hls_time", "6", "-hls_list_size", "0",
+        "-hls_flags", "delete_segments+temp_file",
+        hls_file
+    ]
+    subprocess.run(cmd)
 
-    # requests.Session() ব্যবহার করা
-    with requests.Session() as session:
-        session.headers.update(headers)
-        
-        # === Google Drive স্পেশাল হ্যান্ডলিং ===
-        if original_url_tag.startswith("gdrive:"):
-            file_id = original_url_tag.split(":")[1]
-            original_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-            
-            try:
-                # 1. প্রথম রিকোয়েস্ট
-                r = session.get(original_url, stream=True, allow_redirects=True, timeout=15)
-                r.raise_for_status()
-                
-                # 2. টোকেন খোঁজা
-                match = re.search(r"confirm=([0-9A-Za-z_-]+)", r.text)
-                
-                if match:
-                    # টোকেন পাওয়া গেলে, URL পরিবর্তন করা 
-                    confirm_token = match.group(1)
-                    final_download_url = f"{original_url}&confirm={confirm_token}"
-                    
-                    # 3. কনফার্মেশন টোকেন দিয়ে দ্বিতীয় রিকোয়েস্ট (Session নিজেই কুকি ম্যানেজ করবে)
-                    r = session.get(final_download_url, 
-                                     stream=True, 
-                                     allow_redirects=True, 
-                                     timeout=60) 
-                    r.raise_for_status()
+    # Clean up uploaded file
+    shutil.rmtree(temp_dir, ignore_errors=True)
 
-                # কন্টেন্ট টাইপ চেক: যদি এটি এখনও ছোট HTML পেজ হয়, তবে ত্রুটি দেখাও
-                content_type = r.headers.get('Content-Type', '').lower()
-                content_length = r.headers.get('Content-Length')
+    # Send back watch link
+    host_url = "https://YOUR_RENDER_URL"  # Change to your server URL
+    message.reply_text(f"✅ Video processed!\nWatch here: {host_url}/watch/{vid_id}")
 
-                # যদি এটি text/html হয় এবং সাইজ খুব ছোট হয় (50kb এর কম), তবে ব্যর্থ
-                if 'text/html' in content_type and (content_length is None or int(content_length) < 50000):
-                     print(f"FAILED: Google returned small HTML page for ID: {file_id}")
-                     return f"Download failed: Google Drive returned an unexpected page instead of the file stream. ID: {file_id}", 500
+# -----------------------------
+# Flask Web
+# -----------------------------
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Stream Video</title>
+<link href="https://vjs.zencdn.net/7.15.4/video-js.css" rel="stylesheet" />
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script src="https://vjs.zencdn.net/7.15.4/video.min.js"></script>
+<style>
+body { background:#000; color:#fff; text-align:center; margin-top:30px; }
+video { width:90%; height:auto; border-radius:15px; }
+</style>
+</head>
+<body>
+<h2>{{title}}</h2>
+<video id="video" class="video-js vjs-default-skin" controls></video>
+<script>
+var video = document.getElementById('video');
+if(Hls.isSupported()){
+  var hls = new Hls();
+  hls.loadSource('{{stream_url}}');
+  hls.attachMedia(video);
+  hls.on(Hls.Events.MANIFEST_PARSED,function(){video.play();});
+}else if(video.canPlayType('application/vnd.apple.mpegurl')){
+  video.src='{{stream_url}}';
+  video.addEventListener('loadedmetadata',function(){video.play();});
+}
+</script>
+</body>
+</html>
+"""
 
-                original_response = r
-                
-            except requests.exceptions.RequestException as e:
-                print(f"Google Drive Error: {e}")
-                return f"Error accessing Google Drive file. Source might be down or restricted: {e}", 500
-                
-        # === অন্যান্য ফাইল হ্যান্ডলিং ===
-        else:
-            # নন-Google Drive URL
-            original_url = original_url_tag
-            try:
-                original_response = session.get(original_url, stream=True, allow_redirects=True, timeout=60)
-                original_response.raise_for_status()
-            
-            except requests.exceptions.RequestException as e:
-                print(f"General Proxy Error: {e}")
-                return f"Error accessing external file. Source might be down or restricted: {e}", 500
-
-    
-    # === রেসপন্স স্ট্রিম করা এবং হেডার সেট করা ===
-    
-    r = original_response
-    
-    # ফাইলের নাম নির্ধারণ
-    filename = "downloaded_file.bin"
-    if 'content-disposition' in r.headers:
-        name_match = re.search(r'filename=["\']?(.+?)["\']?$', r.headers['content-disposition'])
-        if name_match:
-            try:
-                filename = name_match.group(1).encode('latin-1').decode('utf-8')
-            except:
-                filename = name_match.group(1).strip()
-    
-    # যদি নাম না পাওয়া যায়
-    if filename == "downloaded_file.bin" and original_url:
-        path_parts = original_url.split('/')
-        temp_name = path_parts[-1].split('?')[0]
-        if temp_name:
-            filename = temp_name
-    
-    
-    response_headers = {
-        'Content-Type': r.headers.get('content-type', 'application/octet-stream'), 
-        'Content-Disposition': f'attachment; filename="{filename}"',
-        'Content-Length': r.headers.get('content-length'),
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Pragma': 'no-cache',
-    }
-    
-    def generate():
-        for chunk in r.iter_content(chunk_size=8192):
-            yield chunk
-
-    return Response(generate(), headers=response_headers)
-
-# [ROUTES: /, /login, /admin, /generate, /logout, /health অপরিবর্তিত]
-
-@app.route("/")
+@app.route('/')
 def home():
-    if "logged_in" in session:
-        return redirect(url_for("admin"))
-    return render_template_string(login_page)
+    return jsonify({"status":"running","message":"Telegram HLS Streaming Server Live!"})
 
-@app.route("/login", methods=["POST"])
-def login():
-    username = request.form.get("username")
-    password = request.form.get("password")
-    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-        session["logged_in"] = True
-        return redirect(url_for("admin"))
-    return "<h3 style='color:red;'>❌ Wrong username or password</h3><a href='/'>Go Back</a>"
+@app.route('/stream/<vid>/<path:filename>')
+def stream(vid, filename):
+    return send_from_directory(os.path.join(STREAM_FOLDER, vid), filename)
 
-@app.route("/admin")
-def admin():
-    if "logged_in" not in session:
-        return redirect("/")
-    return render_template_string(admin_panel)
+@app.route('/watch/<vid>')
+def watch(vid):
+    stream_url = f"/stream/{vid}/master.m3u8"
+    return render_template_string(HTML_TEMPLATE, title="Now Streaming", stream_url=stream_url)
 
-@app.route("/generate", methods=["POST"])
-def generate():
-    if "logged_in" not in session:
-        return redirect("/")
-    url = request.form.get("url")
-    link = generate_proxy_link(url)
-    return render_template_string(admin_panel, link=link)
-
-@app.route("/logout")
-def logout():
-    session.pop("logged_in", None)
-    return redirect("/")
-
-@app.route("/health")
-def health():
-    return "OK", 200
-
+# -----------------------------
+# Run Bot + Flask
+# -----------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000, debug=True)
+    from threading import Thread
+    # Start Bot in separate thread
+    Thread(target=lambda: bot.run()).start()
+    # Start Flask Server
+    app.run(host='0.0.0.0', port=5000)
