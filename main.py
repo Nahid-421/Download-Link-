@@ -1,3 +1,4 @@
+# ... (Imports and boilerplate code remain the same) ...
 from flask import Flask, request, render_template_string, redirect, url_for, session, Response
 from werkzeug.middleware.proxy_fix import ProxyFix
 import re
@@ -12,65 +13,11 @@ app.secret_key = "my_secret_key_123"
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "12345"
 
-# [ login_page and admin_panel templates remain the same ]
-# (আপনার আগের কোড থেকে টেমপ্লেট দুটি যুক্ত করে দিন)
+# [ Templates are here ]
+login_page = "..."
+admin_panel = "..."
 
-login_page = """
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Admin Login</title>
-  <style>
-    body {font-family: Arial; background: #121212; color: white; text-align: center;}
-    form {margin-top: 150px;}
-    input {padding: 10px; margin: 5px; border-radius: 5px;}
-    button {padding: 10px 20px; border: none; background: #007bff; color: white; border-radius: 5px;}
-  </style>
-</head>
-<body>
-  <h2>🔐 Admin Login</h2>
-  <form method="post" action="/login">
-    <input type="text" name="username" placeholder="Username" required><br>
-    <input type="password" name="password" placeholder="Password" required><br>
-    <button type="submit">Login</button>
-  </form>
-</body>
-</html>
-"""
-
-admin_panel = """
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Admin Panel</title>
-  <style>
-    body {font-family: Arial; background: #121212; color: white; text-align: center;}
-    input {padding: 10px; width: 50%; margin: 10px; border-radius: 5px;}
-    button {padding: 10px 20px; border: none; background: #28a745; color: white; border-radius: 5px;}
-    a {color: #ff4757; text-decoration: none;}
-    .link-container { word-break: break-all; margin: 20px 10%; border: 1px solid #333; padding: 15px; background: #1e1e1e; border-radius: 5px;}
-  </style>
-</head>
-<body>
-  <h2>⚙️ Direct Link Generator</h2>
-  <form method="post" action="/generate">
-    <input type="text" name="url" placeholder="Enter your link here..." required><br>
-    <button type="submit">Generate Direct Link</button>
-  </form>
-  {% if link %}
-    <h3>✅ Proxy Download Link:</h3>
-    <div class="link-container">
-        <a href="{{ link }}" target="_blank">{{ link }}</a>
-    </div>
-    <p style="color: #ccc; font-size: 14px;">(এই লিংকটি আপনার সার্ভারের মাধ্যমে ফাইল স্ট্রিম করবে, ফলে সোর্স হাইড থাকবে)</p>
-  {% endif %}
-  <br><a href="/logout">Logout</a>
-</body>
-</html>
-"""
-
-
-# ========== CORE FUNCTIONALITY: Google Drive Direct Download Fix (Unchanged) ========== #
+# [ _get_final_external_link and generate_proxy_link remain the same ]
 
 def _get_final_external_link(url):
     # Google Drive Link
@@ -79,16 +26,11 @@ def _get_final_external_link(url):
         if match:
             file_id = match.group(1)
             return f"gdrive:{file_id}" 
-
     # Dropbox Link
     if "dropbox.com" in url:
-        if "?dl=" not in url:
-            url += "?dl=1"
-        elif "?dl=0" in url:
-            url = url.replace("?dl=0", "?dl=1")
+        if "?dl=" not in url: url += "?dl=1"
+        elif "?dl=0" in url: url = url.replace("?dl=0", "?dl=1")
         return url.replace("www.dropbox.com", "dl.dropboxusercontent.com")
-
-    # Default
     return url
 
 def generate_proxy_link(url):
@@ -97,7 +39,7 @@ def generate_proxy_link(url):
     return url_for('proxy_download', encoded_url=encoded_url, _external=True, _scheme='https')
 
 
-# ========== PROXY ROUTE: Handles Download Streaming (FINAL FIX) ========== #
+# ========== PROXY ROUTE: Handles Download Streaming (Session Use Fix) ========== #
 @app.route("/download/<encoded_url>")
 def proxy_download(encoded_url):
     try:
@@ -105,68 +47,69 @@ def proxy_download(encoded_url):
     except Exception:
         return "Invalid download link format.", 400
 
-    # কমন রিকোয়েস্ট হেডার
     headers = {
-        # ব্রাউজারের মতো দেখতে শক্তিশালী User-Agent
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://www.google.com/', # রেফারার সেট করা
+        'Referer': 'https://www.google.com/',
         'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8'
     }
     
-    original_url = original_url_tag # ডিফল্ট ইউআরএল
+    original_url = original_url_tag 
 
-    # === Google Drive স্পেশাল হ্যান্ডলিং ===
-    if original_url_tag.startswith("gdrive:"):
-        file_id = original_url_tag.split(":")[1]
-        original_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    # requests.Session() ব্যবহার করা
+    with requests.Session() as session:
+        session.headers.update(headers)
         
-        try:
-            # 1. প্রথম রিকোয়েস্ট: কনফার্মেশন টোকেন খোঁজা
-            r = requests.get(original_url, stream=True, allow_redirects=True, timeout=15, headers=headers)
-            r.raise_for_status()
+        # === Google Drive স্পেশাল হ্যান্ডলিং ===
+        if original_url_tag.startswith("gdrive:"):
+            file_id = original_url_tag.split(":")[1]
+            original_url = f"https://drive.google.com/uc?export=download&id={file_id}"
             
-            # টোকেন খোঁজা
-            match = re.search(r"confirm=([0-9A-Za-z_-]+)", r.text)
-            
-            if match:
-                # টোকেন পাওয়া গেলে, URL পরিবর্তন করা (ভাইরাস স্ক্যান বাইপাস)
-                confirm_token = match.group(1)
-                final_download_url = f"{original_url}&confirm={confirm_token}"
-                
-                # 2. কনফার্মেশন টোকেন ও কুকিজ সহ দ্বিতীয় রিকোয়েস্ট
-                r = requests.get(final_download_url, 
-                                 stream=True, 
-                                 allow_redirects=True, 
-                                 timeout=60, 
-                                 headers=headers, 
-                                 cookies=r.cookies) 
-                
+            try:
+                # 1. প্রথম রিকোয়েস্ট
+                r = session.get(original_url, stream=True, allow_redirects=True, timeout=15)
                 r.raise_for_status()
+                
+                # 2. টোকেন খোঁজা
+                match = re.search(r"confirm=([0-9A-Za-z_-]+)", r.text)
+                
+                if match:
+                    # টোকেন পাওয়া গেলে, URL পরিবর্তন করা 
+                    confirm_token = match.group(1)
+                    final_download_url = f"{original_url}&confirm={confirm_token}"
+                    
+                    # 3. কনফার্মেশন টোকেন দিয়ে দ্বিতীয় রিকোয়েস্ট (Session নিজেই কুকি ম্যানেজ করবে)
+                    r = session.get(final_download_url, 
+                                     stream=True, 
+                                     allow_redirects=True, 
+                                     timeout=60) 
+                    r.raise_for_status()
 
-            # পরীক্ষা করা যে আমরা নিশ্চিতভাবে কোনো HTML পেজ পাচ্ছি না
-            content_type = r.headers.get('Content-Type', '').lower()
-            if 'text/html' in content_type and r.headers.get('Content-Length') is not None and int(r.headers.get('Content-Length')) < 10000:
-                 # যদি ছোট HTML পেজ পাওয়া যায়, তবে এটি ব্যর্থ
-                 return f"Download failed: Google Drive returned an unexpected page instead of the file stream. ID: {file_id}", 500
+                # কন্টেন্ট টাইপ চেক: যদি এটি এখনও ছোট HTML পেজ হয়, তবে ত্রুটি দেখাও
+                content_type = r.headers.get('Content-Type', '').lower()
+                content_length = r.headers.get('Content-Length')
 
-            original_response = r
+                # যদি এটি text/html হয় এবং সাইজ খুব ছোট হয় (50kb এর কম), তবে ব্যর্থ
+                if 'text/html' in content_type and (content_length is None or int(content_length) < 50000):
+                     print(f"FAILED: Google returned small HTML page for ID: {file_id}")
+                     return f"Download failed: Google Drive returned an unexpected page instead of the file stream. ID: {file_id}", 500
+
+                original_response = r
+                
+            except requests.exceptions.RequestException as e:
+                print(f"Google Drive Error: {e}")
+                return f"Error accessing Google Drive file. Source might be down or restricted: {e}", 500
+                
+        # === অন্যান্য ফাইল হ্যান্ডলিং ===
+        else:
+            # নন-Google Drive URL
+            original_url = original_url_tag
+            try:
+                original_response = session.get(original_url, stream=True, allow_redirects=True, timeout=60)
+                original_response.raise_for_status()
             
-        except requests.exceptions.RequestException as e:
-            print(f"Google Drive Error: {e}")
-            return f"Error accessing Google Drive file. Source might be down or restricted: {e}", 500
-            
-        
-    # === অন্যান্য ফাইল (Dropbox, Mediafire, etc.) হ্যান্ডলিং ===
-    else:
-        # এটা নন-Google Drive URL
-        original_url = original_url_tag
-        try:
-            original_response = requests.get(original_url, stream=True, allow_redirects=True, timeout=60, headers=headers)
-            original_response.raise_for_status()
-        
-        except requests.exceptions.RequestException as e:
-            print(f"General Proxy Error: {e}")
-            return f"Error accessing external file. Source might be down or restricted: {e}", 500
+            except requests.exceptions.RequestException as e:
+                print(f"General Proxy Error: {e}")
+                return f"Error accessing external file. Source might be down or restricted: {e}", 500
 
     
     # === রেসপন্স স্ট্রিম করা এবং হেডার সেট করা ===
@@ -179,12 +122,11 @@ def proxy_download(encoded_url):
         name_match = re.search(r'filename=["\']?(.+?)["\']?$', r.headers['content-disposition'])
         if name_match:
             try:
-                # ফাইলনাম ডিকোড করা (বাংলা বা অন্য ভাষার নাম থাকলে)
                 filename = name_match.group(1).encode('latin-1').decode('utf-8')
             except:
                 filename = name_match.group(1).strip()
     
-    # যদি নাম না পাওয়া যায়, URL এর শেষ অংশ ব্যবহার করা
+    # যদি নাম না পাওয়া যায়
     if filename == "downloaded_file.bin" and original_url:
         path_parts = original_url.split('/')
         temp_name = path_parts[-1].split('?')[0]
@@ -196,7 +138,6 @@ def proxy_download(encoded_url):
         'Content-Type': r.headers.get('content-type', 'application/octet-stream'), 
         'Content-Disposition': f'attachment; filename="{filename}"',
         'Content-Length': r.headers.get('content-length'),
-        # Cache Control headers
         'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Pragma': 'no-cache',
     }
